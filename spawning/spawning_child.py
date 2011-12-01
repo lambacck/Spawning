@@ -39,6 +39,15 @@ import socket
 import sys
 import time
 
+import logging
+
+log = logging.getLogger('Spawning.child')
+log.addHandler(logging.StreamHandler())
+log.addHandler(logging.StreamHandler())
+
+
+from multiprocessing.reduction import rebuild_handle
+
 import spawning.util
 from spawning import setproctitle, reloader_dev
 
@@ -46,6 +55,31 @@ try:
     import simplejson as json
 except ImportError:
     import json
+
+
+if sys.platform != 'win32':
+    def get_fd(strfd, mode):
+        return int(strfd)
+
+    def set_alarm(timeout, callback):
+        signal.signal(signal.SIGALRM, callback)
+        signal.alarm(timeout)
+
+else:
+    import msvcrt
+    from threading import Thread
+    def get_fd(strfd, mode):
+        handle = int(strfd)
+        return msvcrt.open_osfhandle(handle, mode)
+
+    def set_alarm(timeout, callback):
+        def run_callback():
+            time.sleep(timeout)
+            callback()
+
+        thread = Thread(target=run_callback)
+        thread.daemon = True
+        thread.start()
 
 
 class URLInterceptor(object):
@@ -205,16 +239,18 @@ def tpool_wsgi(app):
     return tpooled_application
 
 
-def warn_controller_of_imminent_death(controller_pid):
+def warn_controller_of_imminent_death(warn_fd):
     # The controller responds to a SIGUSR1 by kicking off a new child process.
     try:
-        os.kill(controller_pid, signal.SIGUSR1)
+        os.write(warn_fd, 'd')
+        os.close(warn_fd)
+        #os.kill(controller_pid, signal.SIGUSR1)
     except OSError, e:
-        if not e.errno == errno.ESRCH:
+        #if not e.errno == errno.ESRCH:
             raise
 
 
-def serve_from_child(sock, config, controller_pid):
+def serve_from_child(sock, config, controller_pid, warn_fd):
     threads = config.get('threadpool_workers', 0)
     wsgi_application = spawning.util.named(config['app_factory'])(config)
 
@@ -270,8 +306,7 @@ def serve_from_child(sock, config, controller_pid):
 
     ## Set a deadman timer to violently kill the process if it doesn't die after
     ## some long timeout.
-    signal.signal(signal.SIGALRM, deadman_timeout)
-    signal.alarm(config['deadman_timeout'])
+    set_alarm(config['deadman_timeout'], deadman_timeout)
 
     ## Once we get here, we just need to handle outstanding sockets, not
     ## accept any new sockets, so we should close the server socket.
@@ -292,10 +327,11 @@ def serve_from_child(sock, config, controller_pid):
 
 
 def child_sighup(*args, **kwargs):
-    exit(0)
+    sys.exit(0)
 
 
 def main():
+    log.debug('here')
     parser = optparse.OptionParser()
     parser.add_option("-r", "--reload",
         action='store_true', dest='reload',
@@ -304,16 +340,18 @@ def main():
 
     options, args = parser.parse_args()
 
-    if len(args) != 5:
-        print "Usage: %s controller_pid httpd_fd death_fd factory_qual factory_args" % (
+    if len(args) != 6:
+        print "Usage: %s controller_pid httpd_fd death_fd warn_fd factory_qual factory_args" % (
             sys.argv[0], )
         sys.exit(1)
 
-    controller_pid, httpd_fd, death_fd, factory_qual, factory_args = args
+    controller_pid, httpd_fd, death_fd, warn_fd, factory_qual, factory_args = args
     controller_pid = int(controller_pid)
     config = spawning.util.named(factory_qual)(json.loads(factory_args))
 
     setproctitle("spawn: child (%s)" % ", ".join(config.get("args")))
+
+    log.debug('httpd_fd (%s), death_fd (%s), warn_fd(%s)', httpd_fd, death_fd, warn_fd)
     
     ## Set up status reporter, if requested
     init_statusobj(config.get('status_port'))
@@ -330,17 +368,17 @@ def main():
             reloader_dev.watch_forever, controller_pid, 1, watch)
 
     ## The parent will catch sigint and tell us to shut down
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    #signal.signal(signal.SIGINT, signal.SIG_IGN)
     ## Expect a SIGHUP when we want the child to die
-    signal.signal(signal.SIGHUP, child_sighup)
-    eventlet.spawn(read_pipe_and_die, int(death_fd), eventlet.getcurrent())
+    #signal.signal(signal.SIGHUP, child_sighup)
+    eventlet.spawn(read_pipe_and_die, get_fd(death_fd, os.O_RDONLY), eventlet.getcurrent())
 
     ## Make the socket object from the fd given to us by the controller
     sock = eventlet.greenio.GreenSocket(
         socket.fromfd(int(httpd_fd), socket.AF_INET, socket.SOCK_STREAM))
 
     serve_from_child(
-        sock, config, controller_pid)
+        sock, config, controller_pid, get_fd(warn_fd, os.O_WRONLY))
 
 if __name__ == '__main__':
     main()

@@ -25,17 +25,28 @@ from __future__ import with_statement
 import eventlet
 eventlet.monkey_patch()
 
-import commands
+#import commands
 import datetime
 import errno
 import logging
 import optparse
-import pprint
+#import pprint
 import signal
 import socket
 import sys
 import time
 import traceback
+
+
+from eventlet.green import subprocess
+from multiprocessing.forking import close, duplicate#, exit
+#from multiprocessing.reduction import reduce_handle #copy sockets
+
+_python_exe = sys.executable
+if sys.platform == 'win32':
+    import msvcrt
+    # XXX explicitly not handling frozen executables yet
+    from multiprocessing.forking import _python_exe
 
 try:
     import simplejson as json
@@ -53,6 +64,55 @@ KEEP_GOING = True
 RESTART_CONTROLLER = False
 PANIC = False
 
+
+
+if sys.platform != 'win32':
+    def copy_fd(fd):
+        return fd
+
+    def copy_socket(fd):
+        return fd
+
+    def install_reload_handler(controller):
+        signal.signal(signal.SIGHUP, controller.handle_sighup)
+
+
+else:
+    def copy_fd(fd):
+        rhandle = duplicate(msvcrt.get_osfhandle(fd), inheritable=True)
+        os.close(fd)
+        return rhandle
+
+    def copy_socket(fd):
+        rhandle = duplicate(fd, inheritable=True)
+        return rhandle
+
+    def install_reload_handler(controller):
+        from eventlet.green.threading import Thread
+        import win32event
+        controller.log.debug('install reload handler')
+        event = win32event.CreateEvent(None, False, False, 'Spawning Controller HUP %d ' % os.getpid())
+
+        def wait_hup():
+            controller.log.debug('in wait signal thread')
+            while True:
+                win32event.WaitForSingleObject(event, win32event.INFINITE)
+                if not controller.keep_going:
+                    break
+
+                controller.handle_sighup()
+
+
+        controller.log.debug('start wait signal thread')
+        thread = Thread(target=wait_hup)
+        thread.daemon = True
+        #thread.start()
+        controller.log.debug('after thread start')
+
+
+
+
+    
 
 DEFAULTS = {
     'num_processes': 4,
@@ -82,13 +142,15 @@ def environ():
     if current_directory not in revised_paths:
         new_path.append(current_directory)
 
-    env['PYTHONPATH'] = ':'.join(new_path)
+    env['PYTHONPATH'] = os.pathsep.join(new_path)
     return env
 
 class Child(object):
-    def __init__(self, pid, kill_pipe):
-        self.pid = pid
+    def __init__(self, proc, kill_pipe, notify_pipe):
+        self.proc = proc
+        self.pid = proc.pid
         self.kill_pipe = kill_pipe
+        self.notify_pipe = notify_pipe
         self.active = True
         self.forked_at = datetime.datetime.now()
 
@@ -122,40 +184,57 @@ class Controller(object):
         parent_pid = os.getpid()
 
         for i in range(number):
-            child_side, parent_side = os.pipe()
-            try:
-                child_pid = os.fork()
-            except:
-                print_exc('Could not fork child! Panic!')
-                ### TODO: restart
+            self.log.debug('createing child %d', i)
 
-            if not child_pid:      # child process
-                os.close(parent_side)
-                command = [sys.executable, '-c',
-                    'import sys; from spawning import spawning_child; spawning_child.main()',
-                    str(parent_pid),
-                    str(self.sock.fileno()),
-                    str(child_side),
-                    self.factory,
-                    json.dumps(self.args)]
-                if self.args['reload'] == 'dev':
-                    command.append('--reload')
-                env = environ()
-                tpool_size = int(self.config.get('threadpool_workers', 0))
-                assert tpool_size >= 0, (tpool_size, 'Cannot have a negative --threads argument')
-                if not tpool_size in (0, 1):
-                    env['EVENTLET_THREADPOOL_SIZE'] = str(tpool_size)
-                os.execve(sys.executable, command, env)
+
+            to_child_r, to_child_w = os.pipe()
+            from_child_r, from_child_w = os.pipe()
+
+            self.log.debug('pipes create')
+
+            to_child_r = copy_fd(to_child_r)
+            from_child_w = copy_fd(from_child_w)
+
+            self.log.debug('pipes copied')
+
+            handle = copy_socket(self.sock.fileno())
+
+            self.log.debug('socket copied')
+            command = [_python_exe, '-c',
+                'import sys; from spawning import spawning_child; spawning_child.main()',
+                str(parent_pid),
+                str(handle),
+                str(to_child_r),
+                str(from_child_w),
+                self.factory,
+                json.dumps(self.args)]
+            if self.args['reload'] == 'dev':
+                command.append('--reload')
+            env = environ()
+            tpool_size = int(self.config.get('threadpool_workers', 0))
+            assert tpool_size >= 0, (tpool_size, 'Cannot have a negative --threads argument')
+            if not tpool_size in (0, 1):
+                env['EVENTLET_THREADPOOL_SIZE'] = str(tpool_size)
+
+            self.log.debug('cmd %s', command)
+            proc = subprocess.Popen(command, env=env)
 
             # controller process
-            os.close(child_side)
-            self.children[child_pid] = Child(child_pid, parent_side)
+            close(to_child_r)
+            close(from_child_w)
+            
+            # XXX create eventlet to listen to from_child_r ?
+            child = self.children[proc.pid] = Child(proc, to_child_w, from_child_r)
+            eventlet.spawn(self.read_child_pipe, from_child_r, child)
+            self.log.debug('create child: %d', proc.pid)
 
     def children_count(self):
         return len(self.children)
 
     def runloop(self):
+        self.log.debug('runloop')
         while self.keep_going:
+            #self.log.debug('about to sleep????')
             eventlet.sleep(0.1)
             ## Only start the number of children we need
             number = self.num_processes - self.children_count()
@@ -168,25 +247,28 @@ class Controller(object):
                 ## If we don't yet have children, let's loop
                 continue
 
-            pid, result = None, None
-            try:
-                pid, result = os.wait()
-            except OSError, e:
-                if e.errno != errno.EINTR:
-                    raise
+            for child in self.children.values():
+                if child.active:
+                    continue
 
-            if pid and self.children.get(pid):
-                try:
-                    child = self.children.pop(pid)
-                    os.close(child.kill_pipe)
-                except (IOError, OSError):
-                    pass
+                result = child.proc.poll()
+                if result is not None:
+                    del self.children[child.pid]
 
-            if result:
-                signum = os.WTERMSIG(result)
-                exitcode = os.WEXITSTATUS(result)
-                self.log.info('(%s) Child died from signal %s with code %s',
-                              pid, signum, exitcode)
+                    try:
+                        os.close(child.kill_pipe)
+                        os.close(child.notify_pipe)
+                    except (IOError, OSError):
+                        pass
+
+                    if sys.platform != 'win32':
+                        signum = os.WTERMSIG(result)
+                        exitcode = os.WEXITSTATUS(result)
+                        self.log.info('(%s) Child died from signal %s with code %s',
+                                      pid, signum, exitcode)
+                    else:
+                        self.log.info('(%s) Child died with code %s',
+                                      pid, result)
 
     def handle_sighup(self, *args, **kwargs):
         ''' Pass `no_restart` to prevent restarting the run loop '''
@@ -229,10 +311,11 @@ class Controller(object):
         if self.sock is None:
             self.sock = bind_socket(self.config)
 
-        signal.signal(signal.SIGHUP, self.handle_sighup)
-        signal.signal(signal.SIGUSR1, self.handle_deadlychild)
+        install_reload_handler(self)
+        #signal.signal(signal.SIGUSR1, self.handle_deadlychild)
 
         if self.config.get('status_port'):
+            self.log.debug('start_status_port')
             from spawning.util import status
             eventlet.spawn(status.Server, self,
                 self.config['status_host'], self.config['status_port'])
@@ -243,6 +326,19 @@ class Controller(object):
             self.keep_going = False
             self.kill_children()
         self.log.info('(%s) *** Controller exiting' % (self.controller_pid))
+
+    def read_child_pipe(self, the_pipe, child):
+        while True:
+            eventlet.hubs.trampoline(the_pipe, read=True)
+            c = os.read(the_pipe, 1)
+            if c == 'd':
+                self.handle_deadlychild()
+                child.active = False
+
+                return
+
+                    
+
 
 def bind_socket(config):
     sleeptime = 0.5
@@ -309,11 +405,12 @@ def main():
             "greenlet-based microthreads, monkeypatching the socket and pipe operations which normally block "
             "to cooperate instead. Note that most blocking database api modules will not "
             "automatically cooperate.")
-    parser.add_option('-d', '--daemonize', dest='daemonize', action='store_true',
-        help="Daemonize after starting children.")
-    parser.add_option('-u', '--chuid', dest='chuid', metavar="ID",
-        help="Change user ID in daemon mode (and group ID if given, "
-             "separate with colon.)")
+    if sys.platform != 'win32':
+        parser.add_option('-d', '--daemonize', dest='daemonize', action='store_true',
+            help="Daemonize after starting children.")
+        parser.add_option('-u', '--chuid', dest='chuid', metavar="ID",
+            help="Change user ID in daemon mode (and group ID if given, "
+                 "separate with colon.)")
     parser.add_option('--pidfile', dest='pidfile', metavar="FILE",
         help="Write own process ID to FILE in daemon mode.")
     parser.add_option('--stdout', dest='stdout', metavar="FILE",
@@ -399,7 +496,7 @@ def main():
         return start_controller(sock, factory, factory_args)
 
     ## We're starting up for the first time.
-    if options.daemonize:
+    if sys.platform != 'win32' and getattr(options,'daemonize'):
         # Do the daemon dance. Note that this isn't what is considered good
         # daemonization, because frankly it's convenient to keep the file
         # descriptiors open (especially when there are prints scattered all
@@ -452,25 +549,25 @@ def main():
             print "(%s) set user=%s group=%s" % (os.getpid(), user, group)
     else:
         # Become a process group leader only if not daemonizing.
-        os.setpgrp()
+        if sys.platform != 'win32':
+            os.setpgrp()
 
     ## Fork off the thing that watches memory for this process group.
     controller_pid = os.getpid()
-    if options.max_memory and not os.fork():
+    if options.max_memory:
         env = environ()
         from spawning import memory_watcher
         basedir, cmdname = os.path.split(memory_watcher.__file__)
         if cmdname.endswith('.pyc'):
             cmdname = cmdname[:-1]
 
-        os.chdir(basedir)
         command = [
-            sys.executable,
+            _python_exe,
             cmdname,
             '--max-age', str(options.max_age),
             str(controller_pid),
             str(options.max_memory)]
-        os.execve(sys.executable, command, env)
+        subprocess.Popen(command, cwd=basedir, env=env)
 
     factory = options.factory
 
